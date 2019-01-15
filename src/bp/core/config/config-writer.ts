@@ -1,9 +1,11 @@
 import { BotTemplate, Logger } from 'botpress/sdk'
 import { Bot } from 'core/misc/interfaces'
+import { FileContent, GhostService } from 'core/services'
 import { CMSService } from 'core/services/cms'
 import { FlowService } from 'core/services/dialog/flow/service'
 import { ModuleResourceLoader } from 'core/services/module/resources-loader'
 import { TYPES } from 'core/types'
+import fs from 'fs'
 import fse from 'fs-extra'
 import { inject, injectable } from 'inversify'
 import defaultJsonBuilder from 'json-schema-defaults'
@@ -13,6 +15,8 @@ import { VError } from 'verror'
 
 import { BotConfig } from './bot.config'
 
+type FileListing = { relativePath: string; absolutePath: string }
+
 @injectable()
 export class BotConfigWriter {
   private BOT_CONFIG_FILENAME = 'bot.config.json'
@@ -20,9 +24,45 @@ export class BotConfigWriter {
 
   constructor(
     @inject(TYPES.Logger) private logger: Logger,
+    @inject(TYPES.GhostService) private ghost: GhostService,
     @inject(TYPES.CMSService) private cms: CMSService,
     @inject(TYPES.FlowService) private flowService: FlowService
   ) {}
+
+  /**
+   * List files recursively from a directory path.
+   * @param dirPath The directory path to list the files from
+   * @param ignores Array of RegEx patterns to ignore while listing the files
+   * @param files The files of the parent directory
+   * @param rootPath The root directory
+   */
+  private _listDir(
+    dirPath: string,
+    ignores: RegExp[] = [],
+    files: FileListing[] = [],
+    rootPath = dirPath
+  ): FileListing[] {
+    let filesNames = fs.readdirSync(dirPath)
+
+    filesNames = filesNames.filter(x => {
+      const match = ignores.filter(i => x.match(i))
+      return match && !match.length
+    })
+
+    for (const fileName of filesNames) {
+      const filePath = path.join(dirPath, fileName)
+      const fileStats = fs.statSync(filePath)
+
+      if (fileStats.isDirectory()) {
+        files = this._listDir(filePath, ignores, files, rootPath)
+      } else {
+        // We keep the files paths relative to the dir root
+        files.push({ relativePath: path.relative(rootPath, filePath), absolutePath: filePath })
+      }
+    }
+
+    return files
+  }
 
   async createFromTemplate(bot: Bot, template: BotTemplate) {
     const resourceLoader = new ModuleResourceLoader(this.logger, template.moduleId!)
@@ -32,9 +72,22 @@ export class BotConfigWriter {
 
     try {
       await fse.ensureDir(botDestinationPath)
-      await fse.copySync(templatePath, botDestinationPath)
 
-      fse.existsSync(templateConfig) ? this._writeTemplateConfig(templateConfig, bot) : this._writeDefaultConfig(bot)
+      const startsWithADot = /^\./gm
+      const templateFiles = this._listDir(templatePath, [startsWithADot]) // OK
+      const scopedGhost = this.ghost.forBot(bot.id)
+      const files = templateFiles.map(f => {
+        return {
+          name: f.relativePath,
+          content: fse.readFileSync(f.absolutePath)
+        } as FileContent
+      })
+
+      console.log('files', files)
+
+      await scopedGhost.upsertFiles(botDestinationPath, files)
+
+      // fse.existsSync(templateConfig) ? this._writeTemplateConfig(templateConfig, bot) : this._writeDefaultConfig(bot)
     } catch (e) {
       throw new VError(e, `Error writing file "${botDestinationPath}"`)
     }
